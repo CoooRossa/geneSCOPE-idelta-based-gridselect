@@ -4,6 +4,8 @@ use std::path::Path;
 
 pub const DEFAULT_WIDTHS_PRESCREEN_V1: &str = include_str!("../../config/widths_prescreen_v1.txt");
 pub const DEFAULT_WIDTHS_ANCHOR_V1: &str = include_str!("../../config/widths_anchor_v1.txt");
+pub const DEFAULT_WIDTHS_PRESCREEN_V2: &str = include_str!("../../config/widths_prescreen_v2.txt");
+pub const DEFAULT_WIDTHS_ANCHOR_V2: &str = include_str!("../../config/widths_anchor_v2.txt");
 
 pub fn parse_widths_um_str(raw: &str, label: &str) -> Result<Vec<u32>> {
     let mut widths: Vec<u32> = Vec::new();

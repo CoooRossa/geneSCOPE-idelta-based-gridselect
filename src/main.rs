@@ -56,6 +56,14 @@ struct RecommendGridArgs {
     #[arg(long, default_value_t = 20)]
     knee_window_um: u32,
 
+    /// Minimum knee-search width (µm). Knee search ignores widths < this value.
+    #[arg(long, default_value_t = 5)]
+    knee_search_min_um: u32,
+
+    /// Descending-segment constraint (µm): knee search starts at w >= w_peak + descending_delta_um.
+    #[arg(long, default_value_t = 2)]
+    descending_delta_um: u32,
+
     /// Number of threads (rayon worker threads).
     #[arg(long, default_value_t = 1)]
     threads: usize,
@@ -99,6 +107,8 @@ fn main() -> Result<()> {
                 prescreen_reps: args.prescreen_reps,
                 seed: args.seed,
                 knee_window_um: args.knee_window_um,
+                knee_search_min_um: args.knee_search_min_um,
+                descending_delta_um: args.descending_delta_um,
                 threads: args.threads,
                 widths_prescreen_path: args.widths_prescreen,
                 widths_anchor_path: args.widths_anchor,

@@ -60,3 +60,53 @@ pub fn knee_max_distance_chord(widths_um: &[u32], y: &[f64]) -> Option<u32> {
 
     Some(w_sorted[best_i])
 }
+
+fn peak_width_um(widths_um: &[u32], y: &[f64]) -> Option<u32> {
+    if widths_um.len() != y.len() || widths_um.is_empty() {
+        return None;
+    }
+    let mut best_y = f64::NEG_INFINITY;
+    let mut best_w: Option<u32> = None;
+    for (&w, &v) in widths_um.iter().zip(y.iter()) {
+        if !v.is_finite() {
+            continue;
+        }
+        if v > best_y {
+            best_y = v;
+            best_w = Some(w);
+        } else if v == best_y {
+            // If the curve plateaus, treat the "peak" as the *last* max-width point.
+            if best_w.map(|bw| w > bw).unwrap_or(true) {
+                best_w = Some(w);
+            }
+        }
+    }
+    best_w
+}
+
+/// Knee detection with a descending-segment-only search domain:
+/// Evaluate candidates only for widths w >= max(knee_search_min_um, w_peak + descending_delta_um).
+pub fn knee_max_distance_chord_descending(
+    widths_um: &[u32],
+    y: &[f64],
+    knee_search_min_um: u32,
+    descending_delta_um: u32,
+) -> Option<u32> {
+    if widths_um.len() != y.len() || widths_um.len() < 3 {
+        return None;
+    }
+    let Some(w_peak) = peak_width_um(widths_um, y) else {
+        return None;
+    };
+    let min_w = knee_search_min_um.max(w_peak.saturating_add(descending_delta_um));
+
+    let mut w_f: Vec<u32> = Vec::new();
+    let mut y_f: Vec<f64> = Vec::new();
+    for (&w, &v) in widths_um.iter().zip(y.iter()) {
+        if w >= min_w {
+            w_f.push(w);
+            y_f.push(v);
+        }
+    }
+    knee_max_distance_chord(&w_f, &y_f)
+}

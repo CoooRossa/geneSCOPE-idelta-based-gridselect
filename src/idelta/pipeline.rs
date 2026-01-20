@@ -1,4 +1,4 @@
-use crate::idelta::knee::knee_max_distance_chord;
+use crate::idelta::knee::knee_max_distance_chord_descending;
 use crate::idelta::smooth::gaussian_smooth_logx;
 use crate::io::molecules::RawMolecule;
 use crate::roi::raster::{GridSpec, RoiMask};
@@ -21,9 +21,13 @@ pub struct PipelineConfig {
     pub prescreen_reps: u32,
     pub seed: u64,
     pub knee_window_um: u32,
+    pub knee_search_min_um: u32,
+    pub descending_delta_um: u32,
     pub threads: usize,
     pub widths_prescreen_um: Vec<u32>,
     pub widths_anchor_um: Vec<u32>,
+    pub widths_prescreen_version: String,
+    pub widths_anchor_version: String,
     pub b_min: u32,
     pub n_min: u32,
     pub min_points: usize,
@@ -122,48 +126,160 @@ pub fn recommend_grid(cfg: PipelineConfig) -> Result<()> {
     )?
     .unwrap_or_else(|| cfg.widths_prescreen_um[cfg.widths_prescreen_um.len() / 2]);
 
-    // Step 3: global final width set for all genes (stable bundle).
-    let widths_final_um = build_global_final_widths(&cfg, prescreen_global_knee_um)?;
-    let widths_final_k: Vec<u32> = widths_final_um.iter().map(|&w| w / cfg.w0_um).collect();
-    let width_to_idx: HashMap<u32, usize> =
-        widths_final_um.iter().enumerate().map(|(i, &w)| (w, i)).collect();
-
-    // Q(w) for evaluated widths.
-    let mut q_by_width: BTreeMap<u32, u64> = BTreeMap::new();
-    for &w in &widths_final_um {
-        q_by_width.insert(w, compute_q_bins(&roi, w)?);
-    }
-    let q_vec: Vec<u64> = widths_final_um
+    // Step 3: build per-gene width sets:
+    // W_final(g) = W_anchor ∪ W_window_dense(g), where W_window_dense(g) is all integer widths
+    // within ±knee_window_um of the gene's *anchor-only* knee estimate.
+    let min_w = cfg
+        .widths_anchor_um
         .iter()
-        .map(|w| q_by_width.get(w).copied().unwrap_or(0))
+        .copied()
+        .chain(cfg.widths_prescreen_um.iter().copied())
+        .min()
+        .unwrap_or(cfg.w0_um);
+    let max_w = cfg
+        .widths_anchor_um
+        .iter()
+        .copied()
+        .chain(cfg.widths_prescreen_um.iter().copied())
+        .max()
+        .unwrap_or(min_w);
+
+    let gene_count = gene_names.len();
+    let mut gene_cells: Vec<Vec<(u32, u32)>> = vec![Vec::new(); gene_count];
+    for m in &molecules {
+        gene_cells[m.gene_id].push((m.cell_i, m.cell_j));
+    }
+
+    // Precompute Q(w) for anchor widths.
+    let widths_anchor_um = cfg.widths_anchor_um.clone();
+    let widths_anchor_k: Vec<u32> = widths_anchor_um.iter().map(|&w| w / cfg.w0_um).collect();
+    let q_anchor: Vec<u64> = widths_anchor_um
+        .iter()
+        .copied()
+        .map(|w| compute_q_bins(&roi, w))
+        .collect::<Result<Vec<u64>>>()?;
+
+    // Anchor-only per-gene knees (used only to define dense windows).
+    let knee_anchor_by_gene: Vec<Option<u32>> = (0..gene_count)
+        .into_par_iter()
+        .map(|g| {
+            let cells = &gene_cells[g];
+            let (_valid_points, knee) = gene_knee_on_widths(
+                &cfg,
+                cells,
+                &widths_anchor_um,
+                &widths_anchor_k,
+                &q_anchor,
+            );
+            knee
+        })
         .collect();
 
-    // Step 4: full-ROI final curves on the global width set.
-    let (rows_by_gene, gene_summaries, informative_gene_ids) = compute_final_curves_and_knees(
+    // Final width sets per gene: anchor ∪ dense window around the anchor-only knee.
+    let widths_final_by_gene: Vec<Vec<u32>> = (0..gene_count)
+        .into_par_iter()
+        .map(|g| {
+            let mut set: BTreeSet<u32> = cfg.widths_anchor_um.iter().copied().collect();
+            if let Some(knee) = knee_anchor_by_gene[g] {
+                let lo = knee.saturating_sub(cfg.knee_window_um).max(min_w);
+                let hi = (knee + cfg.knee_window_um).min(max_w);
+                for w in lo..=hi {
+                    if w % cfg.w0_um == 0 {
+                        set.insert(w);
+                    }
+                }
+            }
+            set.into_iter().collect()
+        })
+        .collect();
+
+    // Q(w) for all widths used by any gene.
+    let mut widths_union: BTreeSet<u32> = BTreeSet::new();
+    for ws in &widths_final_by_gene {
+        widths_union.extend(ws.iter().copied());
+    }
+    let mut q_by_width: HashMap<u32, u64> = HashMap::new();
+    for &w in &widths_union {
+        q_by_width.insert(w, compute_q_bins(&roi, w)?);
+    }
+
+    // Step 4: full-ROI final curves + gene-wise knees (per-gene width sets).
+    let rows_by_gene: Vec<Vec<CurveRow>> = (0..gene_count)
+        .into_par_iter()
+        .map(|g| {
+            let gene = gene_names[g].clone();
+            let cells = &gene_cells[g];
+            let widths_um = &widths_final_by_gene[g];
+            let widths_k: Vec<u32> = widths_um.iter().map(|&w| w / cfg.w0_um).collect();
+            let q_vec: Vec<u64> = widths_um
+                .iter()
+                .map(|w| q_by_width.get(w).copied().unwrap_or(0))
+                .collect();
+            compute_rows_for_gene(&cfg, gene, cells, widths_um, &widths_k, &q_vec)
+        })
+        .collect();
+
+    let gene_summaries: Vec<GeneSummary> = (0..gene_count)
+        .into_par_iter()
+        .map(|g| {
+            let gene = gene_names[g].clone();
+            let rows = &rows_by_gene[g];
+            let valid_points = rows
+                .iter()
+                .filter(|r| r.status == "ok" && r.idelta_smooth.is_some())
+                .count();
+
+            if valid_points < cfg.min_points {
+                return GeneSummary {
+                    gene,
+                    knee_um: None,
+                    gene_status: "excluded_degenerate",
+                };
+            }
+
+            let widths: Vec<u32> = rows.iter().map(|r| r.width_um).collect();
+            let y: Vec<f64> = rows
+                .iter()
+                .map(|r| r.idelta_smooth.unwrap_or(f64::NAN))
+                .collect();
+            let knee = knee_max_distance_chord_descending(
+                &widths,
+                &y,
+                cfg.knee_search_min_um,
+                cfg.descending_delta_um,
+            );
+            let gene_status = if knee.is_some() { "informative" } else { "no_knee" };
+            GeneSummary {
+                gene,
+                knee_um: knee,
+                gene_status,
+            }
+        })
+        .collect();
+
+    let informative_gene_ids: Vec<usize> = gene_order
+        .iter()
+        .copied()
+        .filter(|&g| gene_summaries[g].gene_status == "informative")
+        .collect();
+
+    // Mean curve (diagnostic; computed across informative genes where available).
+    let (avg_widths_um, mean_curve) =
+        compute_mean_curve_sparse(&rows_by_gene, &informative_gene_ids);
+    let knee_of_mean_curve_um = knee_max_distance_chord_descending(
+        &avg_widths_um,
+        &mean_curve,
+        cfg.knee_search_min_um,
+        cfg.descending_delta_um,
+    );
+
+    let (recommended_grid_um, rec_status, rec_note, rec_frac_ge2) = recommend_and_summarize(
         &cfg,
-        &gene_names,
-        &molecules,
-        &widths_final_um,
-        &widths_final_k,
-        &q_vec,
-    )?;
-
-    // avg_curve.tsv + overall knee of mean curve.
-    let mean_curve: Vec<f64> =
-        compute_mean_curve(&rows_by_gene, &informative_gene_ids, widths_final_um.len());
-    let overall_knee_um = knee_max_distance_chord(&widths_final_um, &mean_curve);
-
-    // Recommend grid size (with sanity check + deterministic fallback).
-    let (recommended_grid_um, rec_status, rec_note, rec_frac_ge2) =
-        recommend_with_sanity_check(
-            &cfg,
-            &rows_by_gene,
-            &gene_summaries,
-            &informative_gene_ids,
-            &width_to_idx,
-            &widths_final_um,
-            overall_knee_um,
-        );
+        &rows_by_gene,
+        &gene_summaries,
+        &informative_gene_ids,
+        &gene_cells,
+    );
 
     // Write outputs (stable, minimal bundle).
     write_final_curves_gz(
@@ -173,7 +289,7 @@ pub fn recommend_grid(cfg: PipelineConfig) -> Result<()> {
     )?;
     write_avg_curve(
         Path::new(&cfg.out_dir).join("avg_curve.tsv"),
-        &widths_final_um,
+        &avg_widths_um,
         &mean_curve,
     )?;
     write_knee_summary(
@@ -182,7 +298,7 @@ pub fn recommend_grid(cfg: PipelineConfig) -> Result<()> {
         &gene_order,
         KneeSummaryMeta {
             prescreen_global_knee_um,
-            overall_knee_um,
+            knee_of_mean_curve_um,
             recommended_grid_um,
             recommendation_status: rec_status,
             recommendation_note: rec_note,
@@ -194,6 +310,9 @@ pub fn recommend_grid(cfg: PipelineConfig) -> Result<()> {
             n_min: cfg.n_min,
             min_points: cfg.min_points,
             min_informative_frac_ge2: cfg.min_informative_frac_ge2,
+            knee_search_min_um: cfg.knee_search_min_um,
+            descending_delta_um: cfg.descending_delta_um,
+            widths_anchor_version: cfg.widths_anchor_version.clone(),
         },
     )?;
 
@@ -348,6 +467,161 @@ fn idelta_from_counts(q: u64, sum_n_n1: u64, n: u64) -> Option<f64> {
     Some((q as f64) * (sum_n_n1 as f64) / denom)
 }
 
+fn compute_rows_for_gene(
+    cfg: &PipelineConfig,
+    gene: String,
+    cells: &[(u32, u32)],
+    widths_um: &[u32],
+    widths_k: &[u32],
+    q_by_index: &[u64],
+) -> Vec<CurveRow> {
+    assert_eq!(widths_um.len(), widths_k.len());
+    assert_eq!(widths_um.len(), q_by_index.len());
+
+    let n = cells.len() as u64;
+    let w_len = widths_um.len();
+
+    let mut raw: Vec<f64> = vec![f64::NAN; w_len];
+    let mut status: Vec<&'static str> = vec!["insufficient_n"; w_len];
+    let mut sum_n_n1: Vec<u64> = vec![0u64; w_len];
+    let mut n_bins_ge2: Vec<u32> = vec![0u32; w_len];
+    let mut max_bin_count: Vec<u32> = vec![0u32; w_len];
+
+    for (i, &k) in widths_k.iter().enumerate() {
+        let q = q_by_index[i];
+        let diag = bin_diag_for_width(cells, k);
+        sum_n_n1[i] = diag.sum_n_n1;
+        n_bins_ge2[i] = diag.n_bins_ge2;
+        max_bin_count[i] = diag.max_bin_count;
+
+        let st = if n < 2 {
+            "insufficient_n"
+        } else if q == 0 {
+            "invalid_q"
+        } else if diag.n_bins_ge2 < cfg.b_min {
+            "degenerate_01"
+        } else if diag.sum_n_n1 == 0 && n >= cfg.n_min as u64 {
+            "degenerate_01"
+        } else {
+            "ok"
+        };
+        status[i] = st;
+
+        if st == "ok" {
+            raw[i] = idelta_from_counts(q, diag.sum_n_n1, n).unwrap_or(f64::NAN);
+        }
+    }
+
+    let smooth = gaussian_smooth_logx(widths_um, &raw, 0.35);
+
+    let mut rows: Vec<CurveRow> = Vec::with_capacity(w_len);
+    for i in 0..w_len {
+        let q = q_by_index[i];
+        let frac = if q > 0 {
+            (n_bins_ge2[i] as f64) / (q as f64)
+        } else {
+            f64::NAN
+        };
+        rows.push(CurveRow {
+            gene: gene.clone(),
+            width_um: widths_um[i],
+            n_total: n,
+            q_bins: q,
+            n_bins_ge2: n_bins_ge2[i],
+            frac_bins_ge2: frac,
+            max_bin_count: max_bin_count[i],
+            sum_n_n1: sum_n_n1[i],
+            idelta_raw: if raw[i].is_finite() { Some(raw[i]) } else { None },
+            idelta_smooth: if smooth[i].is_finite() { Some(smooth[i]) } else { None },
+            status: status[i],
+        });
+    }
+    rows
+}
+
+fn gene_knee_on_widths(
+    cfg: &PipelineConfig,
+    cells: &[(u32, u32)],
+    widths_um: &[u32],
+    widths_k: &[u32],
+    q_by_index: &[u64],
+) -> (usize, Option<u32>) {
+    assert_eq!(widths_um.len(), widths_k.len());
+    assert_eq!(widths_um.len(), q_by_index.len());
+
+    let n = cells.len() as u64;
+    let w_len = widths_um.len();
+    let mut raw: Vec<f64> = vec![f64::NAN; w_len];
+    let mut status: Vec<&'static str> = vec!["insufficient_n"; w_len];
+
+    for (i, &k) in widths_k.iter().enumerate() {
+        let q = q_by_index[i];
+        let diag = bin_diag_for_width(cells, k);
+
+        let st = if n < 2 {
+            "insufficient_n"
+        } else if q == 0 {
+            "invalid_q"
+        } else if diag.n_bins_ge2 < cfg.b_min {
+            "degenerate_01"
+        } else if diag.sum_n_n1 == 0 && n >= cfg.n_min as u64 {
+            "degenerate_01"
+        } else {
+            "ok"
+        };
+        status[i] = st;
+        if st == "ok" {
+            raw[i] = idelta_from_counts(q, diag.sum_n_n1, n).unwrap_or(f64::NAN);
+        }
+    }
+
+    let smooth = gaussian_smooth_logx(widths_um, &raw, 0.35);
+    let valid_points = status
+        .iter()
+        .zip(smooth.iter())
+        .filter(|(&st, &v)| st == "ok" && v.is_finite())
+        .count();
+
+    if valid_points < cfg.min_points {
+        return (valid_points, None);
+    }
+
+    let knee = knee_max_distance_chord_descending(
+        widths_um,
+        &smooth,
+        cfg.knee_search_min_um,
+        cfg.descending_delta_um,
+    );
+    (valid_points, knee)
+}
+
+fn compute_mean_curve_sparse(
+    rows_by_gene: &[Vec<CurveRow>],
+    informative_gene_ids: &[usize],
+) -> (Vec<u32>, Vec<f64>) {
+    let mut sum_cnt: BTreeMap<u32, (f64, u64)> = BTreeMap::new();
+    for &g in informative_gene_ids {
+        for r in &rows_by_gene[g] {
+            if r.status != "ok" {
+                continue;
+            }
+            let Some(v) = r.idelta_smooth else {
+                continue;
+            };
+            let entry = sum_cnt.entry(r.width_um).or_insert((0.0, 0));
+            entry.0 += v;
+            entry.1 += 1;
+        }
+    }
+
+    let widths: Vec<u32> = sum_cnt.keys().copied().collect();
+    let mean: Vec<f64> = sum_cnt
+        .values()
+        .map(|(s, c)| if *c > 0 { *s / (*c as f64) } else { f64::NAN })
+        .collect();
+    (widths, mean)
+}
+
 fn prescreen_global_knee(
     cfg: &PipelineConfig,
     roi: &RoiMask,
@@ -451,7 +725,12 @@ fn prescreen_global_knee(
             raw[wi] = idelta_from_counts(q_bins_by_w[wi], sum_med, n_med).unwrap_or(f64::NAN);
         }
         let smooth = gaussian_smooth_logx(wv, &raw, 0.35);
-        if let Some(knee) = knee_max_distance_chord(wv, &smooth) {
+        if let Some(knee) = knee_max_distance_chord_descending(
+            wv,
+            &smooth,
+            cfg.knee_search_min_um,
+            cfg.descending_delta_um,
+        ) {
             knees.push(knee);
         }
     }
@@ -460,284 +739,120 @@ fn prescreen_global_knee(
     Ok(knees.get(knees.len() / 2).copied())
 }
 
-fn build_global_final_widths(cfg: &PipelineConfig, global_knee_um: u32) -> Result<Vec<u32>> {
-    let min_w = cfg
-        .widths_anchor_um
-        .iter()
-        .copied()
-        .chain(cfg.widths_prescreen_um.iter().copied())
-        .min()
-        .unwrap_or(cfg.w0_um);
-    let max_w = cfg
-        .widths_anchor_um
-        .iter()
-        .copied()
-        .chain(cfg.widths_prescreen_um.iter().copied())
-        .max()
-        .unwrap_or(global_knee_um);
-
-    let lo = global_knee_um.saturating_sub(cfg.knee_window_um).max(min_w);
-    let hi = (global_knee_um + cfg.knee_window_um).min(max_w);
-
-    let mut set: BTreeSet<u32> = BTreeSet::new();
-    set.extend(cfg.widths_anchor_um.iter().copied());
-
-    for w in lo..=hi {
-        if w % cfg.w0_um == 0 {
-            set.insert(w);
-        }
-    }
-
-    let mut widths: Vec<u32> = set.into_iter().collect();
-    widths.sort_unstable();
-    if widths.is_empty() {
-        return Err(anyhow!("final width set is empty"));
-    }
-    Ok(widths)
-}
-
-fn compute_final_curves_and_knees(
-    cfg: &PipelineConfig,
-    gene_names: &[String],
-    molecules: &[MoleculeCell],
-    widths_um: &[u32],
-    widths_k: &[u32],
-    q_by_index: &[u64],
-) -> Result<(Vec<Vec<CurveRow>>, Vec<GeneSummary>, Vec<usize>)> {
-    let gene_count = gene_names.len();
-    if widths_um.len() != widths_k.len() || widths_um.len() != q_by_index.len() {
-        return Err(anyhow!("internal error: width/Q length mismatch"));
-    }
-
-    // Collect full-ROI cells per gene.
-    let mut gene_cells: Vec<Vec<(u32, u32)>> = vec![Vec::new(); gene_count];
-    for m in molecules {
-        gene_cells[m.gene_id].push((m.cell_i, m.cell_j));
-    }
-
-    let rows_by_gene: Vec<Vec<CurveRow>> = (0..gene_count)
-        .into_par_iter()
-        .map(|g| {
-            let gene = gene_names[g].clone();
-            let cells = &gene_cells[g];
-            let n = cells.len() as u64;
-
-            let mut raw: Vec<f64> = vec![f64::NAN; widths_um.len()];
-            let mut status: Vec<&'static str> = vec!["insufficient_n"; widths_um.len()];
-            let mut sum_n_n1: Vec<u64> = vec![0u64; widths_um.len()];
-            let mut n_bins_ge2: Vec<u32> = vec![0u32; widths_um.len()];
-            let mut max_bin_count: Vec<u32> = vec![0u32; widths_um.len()];
-
-            for (i, &k) in widths_k.iter().enumerate() {
-                let q = q_by_index[i];
-                let diag = bin_diag_for_width(cells, k);
-                sum_n_n1[i] = diag.sum_n_n1;
-                n_bins_ge2[i] = diag.n_bins_ge2;
-                max_bin_count[i] = diag.max_bin_count;
-
-                let st = if n < 2 {
-                    "insufficient_n"
-                } else if q == 0 {
-                    "invalid_q"
-                } else if diag.n_bins_ge2 < cfg.b_min {
-                    "degenerate_01"
-                } else if diag.sum_n_n1 == 0 && n >= cfg.n_min as u64 {
-                    "degenerate_01"
-                } else {
-                    "ok"
-                };
-                status[i] = st;
-
-                if st == "ok" {
-                    raw[i] = idelta_from_counts(q, diag.sum_n_n1, n).unwrap_or(f64::NAN);
-                }
-            }
-
-            let smooth = gaussian_smooth_logx(widths_um, &raw, 0.35);
-
-            let mut rows: Vec<CurveRow> = Vec::with_capacity(widths_um.len());
-            for i in 0..widths_um.len() {
-                let q = q_by_index[i];
-                let frac = if q > 0 {
-                    (n_bins_ge2[i] as f64) / (q as f64)
-                } else {
-                    f64::NAN
-                };
-                rows.push(CurveRow {
-                    gene: gene.clone(),
-                    width_um: widths_um[i],
-                    n_total: n,
-                    q_bins: q,
-                    n_bins_ge2: n_bins_ge2[i],
-                    frac_bins_ge2: frac,
-                    max_bin_count: max_bin_count[i],
-                    sum_n_n1: sum_n_n1[i],
-                    idelta_raw: if raw[i].is_finite() { Some(raw[i]) } else { None },
-                    idelta_smooth: if smooth[i].is_finite() { Some(smooth[i]) } else { None },
-                    status: status[i],
-                });
-            }
-            rows
-        })
-        .collect();
-
-    let gene_summaries: Vec<GeneSummary> = (0..gene_count)
-        .into_par_iter()
-        .map(|g| {
-            let gene = gene_names[g].clone();
-            let rows = &rows_by_gene[g];
-            let valid_points = rows
-                .iter()
-                .filter(|r| r.status == "ok" && r.idelta_smooth.is_some())
-                .count();
-
-            if valid_points < cfg.min_points {
-                return GeneSummary {
-                    gene,
-                    knee_um: None,
-                    gene_status: "excluded_degenerate",
-                };
-            }
-
-            let widths: Vec<u32> = rows.iter().map(|r| r.width_um).collect();
-            let y: Vec<f64> = rows
-                .iter()
-                .map(|r| r.idelta_smooth.unwrap_or(f64::NAN))
-                .collect();
-            let knee = knee_max_distance_chord(&widths, &y);
-            let gene_status = if knee.is_some() { "informative" } else { "no_knee" };
-            GeneSummary {
-                gene,
-                knee_um: knee,
-                gene_status,
-            }
-        })
-        .collect();
-
-    let gene_order = sorted_gene_order(gene_names);
-    let informative_gene_ids: Vec<usize> = gene_order
-        .into_iter()
-        .filter(|&g| gene_summaries[g].gene_status == "informative")
-        .collect();
-
-    Ok((rows_by_gene, gene_summaries, informative_gene_ids))
-}
-
-fn compute_mean_curve(
-    rows_by_gene: &[Vec<CurveRow>],
-    informative_gene_ids: &[usize],
-    width_len: usize,
-) -> Vec<f64> {
-    let mut sum = vec![0.0f64; width_len];
-    let mut cnt = vec![0u64; width_len];
-
-    // Deterministic sum order: informative_gene_ids is already sorted by gene name.
-    for &g in informative_gene_ids {
-        for (i, r) in rows_by_gene[g].iter().enumerate() {
-            if let Some(v) = r.idelta_smooth {
-                sum[i] += v;
-                cnt[i] += 1;
-            }
-        }
-    }
-
-    (0..width_len)
-        .map(|i| if cnt[i] > 0 { sum[i] / (cnt[i] as f64) } else { f64::NAN })
-        .collect()
-}
-
-fn recommend_with_sanity_check(
+fn recommend_and_summarize(
     cfg: &PipelineConfig,
     rows_by_gene: &[Vec<CurveRow>],
     gene_summaries: &[GeneSummary],
     informative_gene_ids: &[usize],
-    width_to_idx: &HashMap<u32, usize>,
-    widths_um: &[u32],
-    overall_knee_um: Option<u32>,
+    gene_cells: &[Vec<(u32, u32)>],
 ) -> (Option<u32>, String, String, Option<f64>) {
     if informative_gene_ids.is_empty() {
-        let max_w = widths_um.last().copied();
+        let max_w = cfg.widths_anchor_um.iter().copied().max();
         return (
             max_w,
             "no_informative_genes_fallback_max_width".to_string(),
-            "no informative genes after degenerate-point filtering; using max evaluated width"
+            "no informative genes after degenerate-point filtering; using max anchor width"
                 .to_string(),
             None,
         );
     }
 
-    let mut recommended = overall_knee_um;
-    if recommended.is_none() {
-        // Fallback: median of informative gene knees.
-        let mut knees: Vec<u32> = informative_gene_ids
-            .iter()
-            .filter_map(|&g| gene_summaries.get(g).and_then(|s| s.knee_um))
-            .collect();
-        knees.sort_unstable();
-        recommended = knees.get(knees.len() / 2).copied();
-    }
+    // Gene-wise knees across informative genes.
+    let mut knees: Vec<u32> = informative_gene_ids
+        .iter()
+        .filter_map(|&g| gene_summaries.get(g).and_then(|s| s.knee_um))
+        .collect();
+    knees.sort_unstable();
 
-    let Some(mut rec) = recommended else {
-        return (None, "no_recommendation".to_string(), "".to_string(), None);
-    };
+    let mut recommended_grid_um = knees.get(knees.len() / 2).copied();
+    let mut rec_status = "median_gene_knees".to_string();
+    let mut rec_note =
+        "recommended_grid_um is the median of informative gene knees (overall_knee_um is the mean)"
+            .to_string();
 
-    let mut status = "ok".to_string();
-    let mut note = String::new();
-
-    let frac_at = |w: u32| -> Option<f64> {
-        let idx = *width_to_idx.get(&w)?;
+    // Sanity check: require >= min_informative_frac_ge2 of informative genes to have n_bins_ge2 >= b_min at the recommendation.
+    let frac_ge2_at = |w: u32| -> Option<f64> {
         let mut pass = 0u64;
         for &g in informative_gene_ids {
-            let r = &rows_by_gene[g][idx];
-            if r.n_bins_ge2 >= cfg.b_min {
+            let bins_ge2 = if let Some(r) = find_row_by_width(&rows_by_gene[g], w) {
+                r.n_bins_ge2
+            } else {
+                // Not evaluated for this gene: compute on-the-fly for the sanity check only.
+                let k = w / cfg.w0_um;
+                bin_diag_for_width(&gene_cells[g], k).n_bins_ge2
+            };
+            if bins_ge2 >= cfg.b_min {
                 pass += 1;
             }
         }
         Some(pass as f64 / informative_gene_ids.len() as f64)
     };
 
-    let mut frac = frac_at(rec);
-    if let Some(f) = frac {
-        if f < cfg.min_informative_frac_ge2 {
-            // Deterministic conservative fallback: choose the smallest larger evaluated width that passes.
+    let mut rec_frac_ge2 = recommended_grid_um.and_then(frac_ge2_at);
+    if let (Some(rec), Some(frac)) = (recommended_grid_um, rec_frac_ge2) {
+        if frac < cfg.min_informative_frac_ge2 {
+            // Deterministic conservative fallback: scan anchor widths to find the smallest larger width that passes.
+            let mut candidates = cfg.widths_anchor_um.clone();
+            candidates.sort_unstable();
+            candidates.dedup();
+
             let mut found = None;
-            for &w in widths_um {
-                if w <= rec {
+            for &w2 in &candidates {
+                if w2 <= rec {
                     continue;
                 }
-                if let Some(fw) = frac_at(w) {
-                    if fw >= cfg.min_informative_frac_ge2 {
-                        found = Some((w, fw));
+                if let Some(f2) = frac_ge2_at(w2) {
+                    if f2 >= cfg.min_informative_frac_ge2 {
+                        found = Some((w2, f2));
                         break;
                     }
                 }
             }
             match found {
                 Some((w2, f2)) => {
-                    status = "fallback_increase_width".to_string();
-                    note = format!(
-                        "sanity_check failed at {}µm (frac_ge2={:.3}); moved to {}µm (frac_ge2={:.3})",
-                        rec, f, w2, f2
+                    rec_status = "fallback_increase_width".to_string();
+                    rec_note = format!(
+                        "sanity_check failed at {}µm (frac_ge2={:.3}); moved to {}µm (frac_ge2={:.3}); policy=median_gene_knees",
+                        rec, frac, w2, f2
                     );
-                    rec = w2;
-                    frac = Some(f2);
+                    recommended_grid_um = Some(w2);
+                    rec_frac_ge2 = Some(f2);
                 }
                 None => {
-                    status = "fallback_max_width".to_string();
-                    note = format!(
-                        "sanity_check failed at {}µm (frac_ge2={:.3}); no larger evaluated width passed; using max width {}µm",
-                        rec,
-                        f,
-                        widths_um.last().copied().unwrap_or(rec)
+                    let max_w = candidates.last().copied().unwrap_or(rec);
+                    let f2 = frac_ge2_at(max_w);
+                    rec_status = "fallback_max_width".to_string();
+                    rec_note = format!(
+                        "sanity_check failed at {}µm (frac_ge2={:.3}); no larger anchor width passed; using max anchor width {}µm; policy=median_gene_knees",
+                        rec, frac, max_w
                     );
-                    rec = widths_um.last().copied().unwrap_or(rec);
-                    frac = frac_at(rec);
+                    recommended_grid_um = Some(max_w);
+                    rec_frac_ge2 = f2;
                 }
             }
         }
     }
 
-    (Some(rec), status, note, frac)
+    (recommended_grid_um, rec_status, rec_note, rec_frac_ge2)
+}
+
+fn find_row_by_width<'a>(rows: &'a [CurveRow], w: u32) -> Option<&'a CurveRow> {
+    let mut lo = 0usize;
+    let mut hi = rows.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let mw = rows[mid].width_um;
+        if mw < w {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo < rows.len() && rows[lo].width_um == w {
+        Some(&rows[lo])
+    } else {
+        None
+    }
 }
 
 fn median_u64(v: &mut Vec<u64>) -> u64 {
@@ -800,7 +915,7 @@ fn write_avg_curve(path: PathBuf, widths_um: &[u32], mean_curve: &[f64]) -> Resu
 
 struct KneeSummaryMeta {
     prescreen_global_knee_um: u32,
-    overall_knee_um: Option<u32>,
+    knee_of_mean_curve_um: Option<u32>,
     recommended_grid_um: Option<u32>,
     recommendation_status: String,
     recommendation_note: String,
@@ -812,6 +927,9 @@ struct KneeSummaryMeta {
     n_min: u32,
     min_points: usize,
     min_informative_frac_ge2: f64,
+    knee_search_min_um: u32,
+    descending_delta_um: u32,
+    widths_anchor_version: String,
 }
 
 fn write_knee_summary(
@@ -820,10 +938,12 @@ fn write_knee_summary(
     gene_order: &[usize],
     meta: KneeSummaryMeta,
 ) -> Result<()> {
-    let header = [
+    let header_cols = [
+        // Per-gene fields (populated for gene rows).
         "gene",
         "knee_um",
         "gene_status",
+        // Global summary fields (populated only on gene='__SUMMARY__').
         "prescreen_global_knee_um",
         "overall_knee_um",
         "recommended_grid_um",
@@ -841,8 +961,17 @@ fn write_knee_summary(
         "n_min",
         "min_points",
         "min_informative_frac_ge2",
-    ]
-    .join("\t");
+        // Added global fields (summary row only).
+        "overall_knee_median_um",
+        "overall_knee_trimmed_mean_um",
+        "overall_knee_sd_um",
+        "overall_knee_iqr_um",
+        "knee_of_mean_curve_um",
+        "knee_search_min_um",
+        "descending_delta_um",
+        "widths_anchor_version",
+    ];
+    let header = header_cols.join("\t");
 
     let mut knees: Vec<u32> = gene_summaries
         .iter()
@@ -851,42 +980,63 @@ fn write_knee_summary(
         .collect();
     knees.sort_unstable();
     let (knee_mean, knee_sd, knee_min, knee_max) = knee_stats(&knees);
+    let overall_knee_um = knee_mean;
+    let overall_knee_median_um = knees.get(knees.len() / 2).copied();
+    let overall_knee_trimmed_mean_um = trimmed_mean_u32(&knees, 0.10);
+    let overall_knee_sd_um = knee_sd;
+    let overall_knee_iqr_um = iqr_u32(&knees);
 
     let summary_row = {
-        format!(
-            "__SUMMARY__\tNA\tsummary\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}",
-            meta.prescreen_global_knee_um,
-            meta.overall_knee_um.map(|v| v.to_string()).unwrap_or_else(|| "NA".to_string()),
-            meta.recommended_grid_um.map(|v| v.to_string()).unwrap_or_else(|| "NA".to_string()),
-            meta.recommendation_frac_ge2
-                .map(|v| format!("{:.6}", v))
-                .unwrap_or_else(|| "NA".to_string()),
-            meta.recommendation_status,
-            meta.recommendation_note.replace('\t', " "),
-            opt_f64(knee_mean),
-            opt_f64(knee_sd),
-            knee_min.map(|v| v.to_string()).unwrap_or_else(|| "NA".to_string()),
-            knee_max.map(|v| v.to_string()).unwrap_or_else(|| "NA".to_string()),
-            meta.n_genes_total,
-            meta.n_genes_informative,
-            meta.n_genes_excluded_degenerate,
-            meta.b_min,
-            meta.n_min,
-            meta.min_points,
-            meta.min_informative_frac_ge2,
-        )
+        let mut fields: Vec<String> = vec![String::from("NA"); header_cols.len()];
+        fields[0] = "__SUMMARY__".to_string();
+        fields[1] = "NA".to_string();
+        fields[2] = "summary".to_string();
+        fields[3] = meta.prescreen_global_knee_um.to_string();
+        fields[4] = overall_knee_um.map(|v| format!("{:.10}", v)).unwrap_or_else(|| "NA".to_string());
+        fields[5] = meta
+            .recommended_grid_um
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "NA".to_string());
+        fields[6] = meta
+            .recommendation_frac_ge2
+            .map(|v| format!("{:.6}", v))
+            .unwrap_or_else(|| "NA".to_string());
+        fields[7] = meta.recommendation_status.clone();
+        fields[8] = meta.recommendation_note.replace('\t', " ");
+        fields[9] = opt_f64(knee_mean);
+        fields[10] = opt_f64(knee_sd);
+        fields[11] = knee_min.map(|v| v.to_string()).unwrap_or_else(|| "NA".to_string());
+        fields[12] = knee_max.map(|v| v.to_string()).unwrap_or_else(|| "NA".to_string());
+        fields[13] = meta.n_genes_total.to_string();
+        fields[14] = meta.n_genes_informative.to_string();
+        fields[15] = meta.n_genes_excluded_degenerate.to_string();
+        fields[16] = meta.b_min.to_string();
+        fields[17] = meta.n_min.to_string();
+        fields[18] = meta.min_points.to_string();
+        fields[19] = format!("{:.6}", meta.min_informative_frac_ge2);
+        fields[20] = overall_knee_median_um.map(|v| v.to_string()).unwrap_or_else(|| "NA".to_string());
+        fields[21] = overall_knee_trimmed_mean_um.map(|v| format!("{:.10}", v)).unwrap_or_else(|| "NA".to_string());
+        fields[22] = overall_knee_sd_um.map(|v| format!("{:.10}", v)).unwrap_or_else(|| "NA".to_string());
+        fields[23] = overall_knee_iqr_um.map(|v| format!("{:.10}", v)).unwrap_or_else(|| "NA".to_string());
+        fields[24] = meta
+            .knee_of_mean_curve_um
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "NA".to_string());
+        fields[25] = meta.knee_search_min_um.to_string();
+        fields[26] = meta.descending_delta_um.to_string();
+        fields[27] = meta.widths_anchor_version.clone();
+        fields.join("\t")
     };
 
     let mut rows: Vec<String> = Vec::new();
     rows.push(summary_row);
     rows.extend(gene_order.iter().map(|&g| {
         let gs = &gene_summaries[g];
-        format!(
-            "{}\t{}\t{}\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA",
-            gs.gene,
-            gs.knee_um.map(|v| v.to_string()).unwrap_or_else(|| "NA".to_string()),
-            gs.gene_status
-        )
+        let mut fields: Vec<String> = vec![String::from("NA"); header_cols.len()];
+        fields[0] = gs.gene.clone();
+        fields[1] = gs.knee_um.map(|v| v.to_string()).unwrap_or_else(|| "NA".to_string());
+        fields[2] = gs.gene_status.to_string();
+        fields.join("\t")
     }));
 
     crate::io::tsv::write_tsv(path, &header, rows)
@@ -912,6 +1062,32 @@ fn knee_stats(knees: &[u32]) -> (Option<f64>, Option<f64>, Option<u32>, Option<u
     };
     let sd = var.sqrt();
     (Some(mean), Some(sd), knees.first().copied(), knees.last().copied())
+}
+
+fn trimmed_mean_u32(knees_sorted: &[u32], trim: f64) -> Option<f64> {
+    if knees_sorted.is_empty() {
+        return None;
+    }
+    let n = knees_sorted.len();
+    let mut k = (trim.max(0.0).min(0.49) * n as f64).floor() as usize;
+    if 2 * k >= n {
+        k = n / 2;
+    }
+    let slice = &knees_sorted[k..(n - k)];
+    if slice.is_empty() {
+        return None;
+    }
+    Some(slice.iter().map(|&v| v as f64).sum::<f64>() / slice.len() as f64)
+}
+
+fn iqr_u32(knees_sorted: &[u32]) -> Option<f64> {
+    if knees_sorted.is_empty() {
+        return None;
+    }
+    let n = knees_sorted.len();
+    let q1 = knees_sorted[n / 4] as f64;
+    let q3 = knees_sorted[(3 * n) / 4] as f64;
+    Some(q3 - q1)
 }
 
 #[cfg(test)]
