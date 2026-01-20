@@ -19,8 +19,8 @@ pub struct RecommendGridConfig {
     pub seed: u64,
     pub knee_window_um: u32,
     pub threads: usize,
-    pub widths_prescreen_path: String,
-    pub widths_anchor_path: String,
+    pub widths_prescreen_path: Option<String>,
+    pub widths_anchor_path: Option<String>,
     pub b_min: u32,
     pub n_min: u32,
     pub min_points: usize,
@@ -53,14 +53,24 @@ pub fn recommend_grid(cfg: RecommendGridConfig) -> Result<()> {
         return Err(anyhow!("--min-informative-frac-ge2 must be in (0, 1]"));
     }
 
-    let widths_prescreen =
-        config::read_widths_um(&cfg.widths_prescreen_path).with_context(|| {
-            format!("failed reading --widths-prescreen: {}", cfg.widths_prescreen_path)
-        })?;
-    let widths_anchor =
-        config::read_widths_um(&cfg.widths_anchor_path).with_context(|| {
-            format!("failed reading --widths-anchor: {}", cfg.widths_anchor_path)
-        })?;
+    let widths_prescreen = match cfg.widths_prescreen_path.as_deref() {
+        Some(path) => config::read_widths_um(path)
+            .with_context(|| format!("failed reading --widths-prescreen: {}", path))?,
+        None => config::parse_widths_um_str(
+            config::DEFAULT_WIDTHS_PRESCREEN_V1,
+            "embedded: widths_prescreen_v1",
+        )
+        .context("failed parsing embedded prescreen widths")?,
+    };
+    let widths_anchor = match cfg.widths_anchor_path.as_deref() {
+        Some(path) => config::read_widths_um(path)
+            .with_context(|| format!("failed reading --widths-anchor: {}", path))?,
+        None => config::parse_widths_um_str(
+            config::DEFAULT_WIDTHS_ANCHOR_V1,
+            "embedded: widths_anchor_v1",
+        )
+        .context("failed parsing embedded anchor widths")?,
+    };
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.threads)
@@ -81,8 +91,6 @@ pub fn recommend_grid(cfg: RecommendGridConfig) -> Result<()> {
             threads: cfg.threads,
             widths_prescreen_um: widths_prescreen,
             widths_anchor_um: widths_anchor,
-            widths_prescreen_path: cfg.widths_prescreen_path,
-            widths_anchor_path: cfg.widths_anchor_path,
             b_min: cfg.b_min,
             n_min: cfg.n_min,
             min_points: cfg.min_points,

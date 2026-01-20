@@ -60,13 +60,13 @@ struct RecommendGridArgs {
     #[arg(long, default_value_t = 1)]
     threads: usize,
 
-    /// Prescreen widths file (one width per line, µm).
-    #[arg(long, default_value = "config/widths_prescreen_v1.txt")]
-    widths_prescreen: String,
+    /// Optional prescreen widths file (one width per line, µm); defaults to embedded `widths_prescreen_v1`.
+    #[arg(long)]
+    widths_prescreen: Option<String>,
 
-    /// Anchor widths file (one width per line, µm).
-    #[arg(long, default_value = "config/widths_anchor_v1.txt")]
-    widths_anchor: String,
+    /// Optional anchor widths file (one width per line, µm); defaults to embedded `widths_anchor_v1`.
+    #[arg(long)]
+    widths_anchor: Option<String>,
 
     /// Minimum number of bins with n_i >= 2 required for a non-degenerate point.
     #[arg(long, default_value_t = 50)]

@@ -24,8 +24,6 @@ pub struct PipelineConfig {
     pub threads: usize,
     pub widths_prescreen_um: Vec<u32>,
     pub widths_anchor_um: Vec<u32>,
-    pub widths_prescreen_path: String,
-    pub widths_anchor_path: String,
     pub b_min: u32,
     pub n_min: u32,
     pub min_points: usize,
