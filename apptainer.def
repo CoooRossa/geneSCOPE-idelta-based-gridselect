@@ -1,0 +1,16 @@
+Bootstrap: docker
+From: rust:stable-slim
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+    mkdir -p /opt/idelta-gridselect
+
+%files
+    . /opt/idelta-gridselect
+
+%post
+    cd /opt/idelta-gridselect
+    cargo build --release
+
+%runscript
+    exec /opt/idelta-gridselect/target/release/idelta-gridselect "$@"
