@@ -68,11 +68,11 @@ struct RecommendGridArgs {
     #[arg(long, default_value_t = 1)]
     threads: usize,
 
-    /// Optional prescreen widths file (one width per line, µm); defaults to embedded `widths_prescreen_v1`.
+    /// Optional prescreen widths file (one width per line, µm); defaults to embedded `widths_prescreen_v2`.
     #[arg(long)]
     widths_prescreen: Option<String>,
 
-    /// Optional anchor widths file (one width per line, µm); defaults to embedded `widths_anchor_v1`.
+    /// Optional anchor widths file (one width per line, µm); defaults to embedded `widths_anchor_v2`.
     #[arg(long)]
     widths_anchor: Option<String>,
 
