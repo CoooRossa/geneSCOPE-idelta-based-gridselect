@@ -16,6 +16,9 @@ struct Cli {
 enum Commands {
     /// Recommend an optimal grid size (µm) with a minimal diagnostics bundle.
     RecommendGrid(RecommendGridArgs),
+    /// Build a bbox-prefiltered molecules TSV from a Xenium transcripts table.
+    #[command(name = "make-molecules-bbox")]
+    MakeMoleculesBBox(MakeMoleculesBBoxArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -93,6 +96,37 @@ struct RecommendGridArgs {
     min_informative_frac_ge2: f64,
 }
 
+#[derive(Parser, Debug)]
+struct MakeMoleculesBBoxArgs {
+    /// ROI vertices CSV/TSV with x_um,y_um (comments allowed).
+    #[arg(long)]
+    roi_csv: String,
+
+    /// Xenium transcripts table: CSV/TSV (optionally .gz) or Parquet.
+    #[arg(long)]
+    transcripts: String,
+
+    /// Output TSV path (gene, x_um, y_um).
+    #[arg(long)]
+    out_tsv: String,
+
+    /// Gene column name in transcripts.
+    #[arg(long, default_value = "feature_name")]
+    gene_col: String,
+
+    /// X column name in transcripts (µm).
+    #[arg(long, default_value = "x_location")]
+    x_col: String,
+
+    /// Y column name in transcripts (µm).
+    #[arg(long, default_value = "y_location")]
+    y_col: String,
+
+    /// Comma-separated list of gene-name prefixes to exclude.
+    #[arg(long, default_value = "Unassigned,NegControl,Background,DeprecatedCodeword,SystemControl,Negative,BlankCodeword,Blank")]
+    exclude_prefixes: String,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -118,6 +152,26 @@ fn main() -> Result<()> {
                 min_informative_frac_ge2: args.min_informative_frac_ge2,
             };
             idelta_gridselect::recommend_grid(cfg)
+        }
+        Commands::MakeMoleculesBBox(args) => {
+            let exclude_prefixes: Vec<String> = args
+                .exclude_prefixes
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            idelta_gridselect::io::molecules_bbox::make_molecules_bbox(
+                idelta_gridselect::io::molecules_bbox::MakeMoleculesBBoxConfig {
+                    roi_csv: args.roi_csv,
+                    transcripts_path: args.transcripts,
+                    out_tsv: args.out_tsv,
+                    gene_col: args.gene_col,
+                    x_col: args.x_col,
+                    y_col: args.y_col,
+                    exclude_prefixes,
+                },
+            )
         }
     }
 }

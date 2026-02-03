@@ -14,7 +14,7 @@ One-step runner for local `idelta-gridselect recommend-grid` that:
 
 Usage:
   integrations/geneSCOPE/run_idelta_gridselect.sh \
-    --xenium_dir <outs_dir> | --transcripts <transcripts.csv.gz> \
+    --xenium_dir <outs_dir> | --transcripts <transcripts.csv.gz|csv|parquet> \
     --roi_csv <roi_vertices_csv> \
     --out <out_dir> \
     [--knee-search-min-um <int>] [--descending-delta-um <int>] \
@@ -88,8 +88,12 @@ if [ -n "$XENIUM_DIR" ]; then
     TRANSCRIPTS="$XENIUM_DIR/transcripts.csv.gz"
   elif [ -f "$XENIUM_DIR/transcripts.csv" ]; then
     TRANSCRIPTS="$XENIUM_DIR/transcripts.csv"
+  elif [ -f "$XENIUM_DIR/transcripts.parquet" ]; then
+    TRANSCRIPTS="$XENIUM_DIR/transcripts.parquet"
+  elif [ -f "$XENIUM_DIR/transcripts.pq" ]; then
+    TRANSCRIPTS="$XENIUM_DIR/transcripts.pq"
   else
-    err "Could not find transcripts.csv.gz (or transcripts.csv) under: $XENIUM_DIR"
+    err "Could not find transcripts.csv.gz (or transcripts.csv / transcripts.parquet) under: $XENIUM_DIR"
   fi
 fi
 
@@ -234,19 +238,17 @@ if n < 3:
 PY
 fi
 
-# 2) Generate bbox-prefiltered molecules.
-PY_HELPER="$SCRIPT_DIR/make_molecules_bbox.py"
-[ -f "$PY_HELPER" ] || err "python helper not found: $PY_HELPER"
+# 2) Generate bbox-prefiltered molecules (tool-side helper; supports CSV/TSV(.gz) and Parquet transcripts).
 
 if [ "$SKIP_MOLECULES" = "1" ]; then
   [ -s "$MOLS_BBOX" ] || err "--skip_molecules was set but missing: $MOLS_BBOX"
 else
-  if [ ! -s "$MOLS_BBOX" ] || [ "$MOLS_BBOX" -ot "$TRANSCRIPTS" ] || [ "$MOLS_BBOX" -ot "$ROI_NORM" ] || [ "$MOLS_BBOX" -ot "$PY_HELPER" ]; then
+  if [ ! -s "$MOLS_BBOX" ] || [ "$MOLS_BBOX" -ot "$TRANSCRIPTS" ] || [ "$MOLS_BBOX" -ot "$ROI_NORM" ]; then
     rm -f "$MOLS_LOG" 2>/dev/null || true
-    python3 "$PY_HELPER" \
-      --roi_csv "$ROI_NORM" \
-      --transcripts_gz "$TRANSCRIPTS" \
-      --out_tsv "$MOLS_BBOX" >"$MOLS_LOG" 2>&1 || {
+    "$BIN_PATH" make-molecules-bbox \
+      --roi-csv "$ROI_NORM" \
+      --transcripts "$TRANSCRIPTS" \
+      --out-tsv "$MOLS_BBOX" >"$MOLS_LOG" 2>&1 || {
         tail -n 50 "$MOLS_LOG" >&2 || true
         err "molecules bbox extraction failed; see $MOLS_LOG"
       }
@@ -337,4 +339,3 @@ PY
 echo "RECOMMENDED_GRID_UM=$REC"
 
 exit 0
-
